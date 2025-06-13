@@ -1,11 +1,20 @@
+import * as protoLoader from "@grpc/proto-loader";
+import * as grpc from "@grpc/grpc-js";
+import { ClientDuplexStream } from "@grpc/grpc-js";
+import { PublicKey } from "@solana/web3.js";
 import * as fs from "node:fs/promises";
 import bs58 from "bs58";
-import { PublicKey } from "@solana/web3.js";
 import {
+  PUMP_AMM_INSTRUCTIONS,
   SPL_TOKEN_INSTRUCTIONS,
   SYSTEM_INSTRUCTIONS,
-  PUMP_AMM_INSTRUCTIONS,
 } from "./parsers";
+import {
+  CommitmentLevel,
+  ISubscribeRequest,
+  ISubscribeUpdate,
+  ISubscribeUpdateTransaction,
+} from "./types";
 
 const PUMP_PROGRAM_ID = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 const SPL_TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
@@ -15,23 +24,6 @@ const FILTER_CONFIG = {
   programIds: [PUMP_PROGRAM_ID],
   instructionDiscriminators: [],
 };
-
-// const ACCOUNTS_TO_INCLUDE = [
-//   {
-//     name: "mint",
-//     index: 0,
-//   },
-// ];
-
-import * as grpc from "@grpc/grpc-js";
-import * as protoLoader from "@grpc/proto-loader";
-import { ClientDuplexStream } from "@grpc/grpc-js";
-import {
-  ISubscribeRequest,
-  ISubscribeUpdate,
-  ISubscribeUpdateTransaction,
-} from "./types";
-
 const PROTO_PATH = "./proto/geyser.proto";
 
 const packageDefinition = protoLoader.loadSync(PROTO_PATH, {
@@ -40,10 +32,12 @@ const packageDefinition = protoLoader.loadSync(PROTO_PATH, {
   enums: String,
   defaults: true,
   oneofs: true,
+  json: true,
 });
 
 async function main(): Promise<void> {
   const protoDescriptor = grpc.loadPackageDefinition(packageDefinition) as any;
+  await fs.mkdir("transactions", { recursive: true });
 
   const client = new protoDescriptor.geyser.Geyser(
     "solana-yellowstone-grpc.publicnode.com:443",
@@ -89,7 +83,6 @@ function readArg(buffer: Buffer, offset: number, type: string): [any, number] {
     case "string": {
       let len = buffer.readUInt32LE(offset);
       if (len > 5000) {
-        console.log(len);
         len = buffer.readUInt32LE(offset + 4);
       }
       const str = buffer.slice(offset + 4, offset + 4 + len).toString("utf8");
@@ -137,16 +130,25 @@ function handleStreamEvents(
   stream: ClientDuplexStream<ISubscribeRequest, ISubscribeUpdate>
 ): Promise<void> {
   return new Promise<void>((resolve, reject) => {
-    stream.on("data", handleData);
+    stream.on("data", async (data) => {
+      try {
+        handleData(data);
+      } catch (err) {
+        console.error("Error handling data:", err);
+      }
+    });
+
     stream.on("error", (error: Error) => {
       console.error("Stream error:", error);
       reject(error);
       stream.end();
     });
+
     stream.on("end", () => {
       console.log("Stream ended");
       resolve();
     });
+
     stream.on("close", () => {
       console.log("Stream closed");
       resolve();
@@ -154,9 +156,9 @@ function handleStreamEvents(
   });
 }
 
-function handleData(data: ISubscribeUpdate): void {
+async function handleData(data: ISubscribeUpdate): Promise<void> {
   const tx = data?.transaction?.transaction;
-  const accounts = tx.transaction.message.accountKeys.map(
+  const accounts: string[] = tx.transaction.message.accountKeys.map(
     (key: Uint8Array<ArrayBufferLike>) => bs58.encode(key)
   );
   if (
@@ -184,77 +186,73 @@ function handleData(data: ISubscribeUpdate): void {
       return;
     }
     let decoded;
-    // @ts-ignore
     const data = Buffer.from(ix.data);
 
     if (programId === PUMP_PROGRAM_ID) {
-      // @ts-ignore
       decoded = decodePumpAmmInstruction(data);
     } else if (programId === SPL_TOKEN_PROGRAM_ID) {
-      // @ts-ignore
       decoded = decodeSplTokenInstruction(data);
     } else if (programId === SYSTEM_PROGRAM_ID) {
-      // @ts-ignore
       decoded = decodeSystemInstruction(data);
     }
-    const result = {
-      programId,
-      discriminator: data[0],
-      // @ts-ignore
+
+    const result: any = {
+      programId: accounts[ix.programIdIndex],
+      discriminator: ix.data[0],
       _accounts: Array.from(ix.accounts),
-      accounts: Array.from(ix.accounts).map((account) => accounts[account]),
+      accounts: Array.from(ix.accounts).map((index: number) => accounts[index]),
     };
 
     if (decoded) {
-      const innerAccounts = {};
-      result["decoded"] = decoded;
-      decoded.accounts.map((account, index) => {
+      const innerAccounts: Record<string, string> = {};
+      result.decoded = decoded;
+
+      decoded.accounts?.forEach((account: string, index: number) => {
         innerAccounts[account] = result.accounts[index];
       });
-      // @ts-ignore
+
       result.accounts = innerAccounts;
     }
     const inner = innerMap.get(i);
     if (inner) {
-      result["innerPrograms"] = [];
+      result.innerPrograms = [];
+
       for (const innerIx of inner) {
         const innerProgramId = accounts[innerIx.programIdIndex];
-        const innerAccounts = Array.from(innerIx.accounts).map(
-          // @ts-ignore
+        const innerAccountsList = Array.from<number>(innerIx.accounts).map(
           (j) => accounts[j]
         );
 
-        let innerDecoded;
-        // @ts-ignore
         const innerData = Buffer.from(innerIx.data);
+        let innerDecoded;
+
         if (innerProgramId === PUMP_PROGRAM_ID) {
-          // @ts-ignore
           innerDecoded = decodePumpAmmInstruction(innerData);
         } else if (innerProgramId === SPL_TOKEN_PROGRAM_ID) {
-          // @ts-ignore
           innerDecoded = decodeSplTokenInstruction(innerData);
         } else if (innerProgramId === SYSTEM_PROGRAM_ID) {
-          // @ts-ignore
           innerDecoded = decodeSystemInstruction(innerData);
         }
 
-        const data = {
+        const innerResult: any = {
           programId: innerProgramId,
           discriminator: innerData[0],
           _accounts: Array.from(innerIx.accounts),
-          accounts: innerAccounts,
+          accounts: innerAccountsList,
           stackHeight: innerIx.stackHeight,
         };
         if (innerDecoded) {
-          const innerAccounts = {};
-          data["decoded"] = innerDecoded;
-          innerDecoded.accounts.map((account, index) => {
-            innerAccounts[account] = data.accounts[index];
+          const mappedAccounts: Record<string, string> = {};
+          innerResult.decoded = innerDecoded;
+
+          innerDecoded.accounts?.forEach((acc: string, idx: number) => {
+            mappedAccounts[acc] = innerResult.accounts[idx];
           });
-          // @ts-ignore
-          data.accounts = innerAccounts;
+
+          innerResult.accounts = mappedAccounts;
         }
-        result["innerPrograms"].push(data);
+
+        result.innerPrograms.push(innerResult);
       }
 
       const tokenChanges = (tx.meta?.postTokenBalances || []).map((post) => {
@@ -271,24 +269,24 @@ function handleData(data: ISubscribeUpdate): void {
           owner: post.owner,
         };
       });
-      result["tokenChanges"] = tokenChanges;
+
+      result.tokenChanges = tokenChanges;
       resultArr.push(result);
     }
 
-    console.dir(result, { depth: null });
     try {
-      fs.writeFile(
+      await fs.writeFile(
         `transactions/${signature}.json`,
         getStringFromDataObject(tx),
         "utf-8"
       );
-      fs.writeFile(
+      await fs.writeFile(
         `transactions/${signature}_result.json`,
         getStringFromDataObject(resultArr),
         "utf-8"
       );
     } catch (err) {
-      console.error(err);
+      console.error("Error writing transaction files:", err);
     }
   }
 }
@@ -328,7 +326,7 @@ function createSubscribeRequest(): ISubscribeRequest {
       // @ts-ignore
       filter1: { account_include: FILTER_CONFIG.programIds },
     },
-    commitment: 2,
+    commitment: CommitmentLevel.FINALIZED,
   };
 }
 
