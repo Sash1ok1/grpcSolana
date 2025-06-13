@@ -157,50 +157,50 @@ function handleStreamEvents(
 }
 
 async function handleData(data: ISubscribeUpdate): Promise<void> {
-  const tx = data?.transaction?.transaction;
-  const accounts: string[] = tx.transaction.message.accountKeys.map(
-    (key: Uint8Array<ArrayBufferLike>) => bs58.encode(key)
-  );
+  if (!data?.transaction?.transaction) {
+    return;
+  }
+  const parsed = convertBuffersToBase58(data);
+  const {
+    transaction: {
+      message: { accountKeys, instructions },
+    },
+    meta,
+    signature,
+  } = parsed.transaction.transaction;
+
   if (
     !isSubscribeUpdateTransaction(data) ||
-    !accounts.includes(PUMP_PROGRAM_ID)
+    !accountKeys.includes(PUMP_PROGRAM_ID)
   ) {
     return;
   }
 
-  const signature = bs58.encode(tx.signature);
-
   const innerMap = new Map<number, any[]>();
   const resultArr = [];
-  for (const inner of tx.meta?.innerInstructions || []) {
+  for (const inner of meta?.innerInstructions || []) {
     innerMap.set(inner.index, inner.instructions);
   }
 
-  for (let i = 0; i < tx.transaction.message.instructions.length; i++) {
-    const ix = tx.transaction.message.instructions[i];
+  for (let i = 0; i < instructions.length; i++) {
+    const ix = instructions[i];
     const programId =
       typeof ix.programIdIndex === "string"
         ? ix.programIdIndex
-        : accounts[ix.programIdIndex];
+        : accountKeys[ix.programIdIndex];
     if (!ix?.data) {
       return;
     }
-    let decoded;
-    const data = Buffer.from(ix.data);
-
-    if (programId === PUMP_PROGRAM_ID) {
-      decoded = decodePumpAmmInstruction(data);
-    } else if (programId === SPL_TOKEN_PROGRAM_ID) {
-      decoded = decodeSplTokenInstruction(data);
-    } else if (programId === SYSTEM_PROGRAM_ID) {
-      decoded = decodeSystemInstruction(data);
-    }
+    const data = Buffer.from(bs58.decode(ix.data));
+    const decoded = decodeIDL(programId, data);
 
     const result: any = {
-      programId: accounts[ix.programIdIndex],
+      programId: accountKeys[ix.programIdIndex],
       discriminator: ix.data[0],
       _accounts: Array.from(ix.accounts),
-      accounts: Array.from(ix.accounts).map((index: number) => accounts[index]),
+      accounts: Array.from<number>(ix.accounts).map(
+        (index) => accountKeys[index]
+      ),
     };
 
     if (decoded) {
@@ -218,21 +218,13 @@ async function handleData(data: ISubscribeUpdate): Promise<void> {
       result.innerPrograms = [];
 
       for (const innerIx of inner) {
-        const innerProgramId = accounts[innerIx.programIdIndex];
+        const innerProgramId = accountKeys[innerIx.programIdIndex];
         const innerAccountsList = Array.from<number>(innerIx.accounts).map(
-          (j) => accounts[j]
+          (j) => accountKeys[j]
         );
 
-        const innerData = Buffer.from(innerIx.data);
-        let innerDecoded;
-
-        if (innerProgramId === PUMP_PROGRAM_ID) {
-          innerDecoded = decodePumpAmmInstruction(innerData);
-        } else if (innerProgramId === SPL_TOKEN_PROGRAM_ID) {
-          innerDecoded = decodeSplTokenInstruction(innerData);
-        } else if (innerProgramId === SYSTEM_PROGRAM_ID) {
-          innerDecoded = decodeSystemInstruction(innerData);
-        }
+        const innerData = Buffer.from(bs58.decode(innerIx.data));
+        const innerDecoded = decodeIDL(innerProgramId, innerData);
 
         const innerResult: any = {
           programId: innerProgramId,
@@ -255,15 +247,15 @@ async function handleData(data: ISubscribeUpdate): Promise<void> {
         result.innerPrograms.push(innerResult);
       }
 
-      const tokenChanges = (tx.meta?.postTokenBalances || []).map((post) => {
-        const pre = tx.meta?.preTokenBalances?.find(
+      const tokenChanges = (meta?.postTokenBalances || []).map((post) => {
+        const pre = meta?.preTokenBalances?.find(
           (p) => p.accountIndex === post.accountIndex
         );
         const delta =
           BigInt(post.uiTokenAmount.amount) -
           BigInt(pre?.uiTokenAmount?.amount || "0");
         return {
-          account: accounts[post.accountIndex],
+          account: accountKeys[post.accountIndex],
           mint: post.mint,
           delta,
           owner: post.owner,
@@ -277,7 +269,7 @@ async function handleData(data: ISubscribeUpdate): Promise<void> {
     try {
       await fs.writeFile(
         `transactions/${signature}.json`,
-        getStringFromDataObject(tx),
+        getStringFromDataObject(parsed),
         "utf-8"
       );
       await fs.writeFile(
@@ -301,7 +293,6 @@ function sendSubscribeRequest(
         console.log({ err });
         reject(err);
       } else {
-        console.log("resolve");
         resolve();
       }
     });
@@ -330,10 +321,45 @@ function createSubscribeRequest(): ISubscribeRequest {
   };
 }
 
+function decodeIDL(programId: string, data: any): any {
+  if (programId === PUMP_PROGRAM_ID) {
+    return decodePumpAmmInstruction(data);
+  } else if (programId === SPL_TOKEN_PROGRAM_ID) {
+    return decodeSplTokenInstruction(data);
+  } else if (programId === SYSTEM_PROGRAM_ID) {
+    return decodeSystemInstruction(data);
+  }
+  return;
+}
+
 function getStringFromDataObject(data: any): any {
   return JSON.stringify(data, (_key, value) =>
     typeof value === "bigint" ? Number(value) : value
   );
+}
+
+function convertBuffersToBase58(value: any): any {
+  if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
+    return bs58.encode(Buffer.from(value));
+  }
+
+  if (Array.isArray(value)) {
+    return value.map(convertBuffersToBase58);
+  }
+
+  if (value && typeof value === "object") {
+    const converted: Record<string, any> = {};
+    for (const key in value) {
+      if (key === "accounts") {
+        converted[key] = Array.from(value[key]);
+      } else {
+        converted[key] = convertBuffersToBase58(value[key]);
+      }
+    }
+    return converted;
+  }
+
+  return value;
 }
 
 main();
